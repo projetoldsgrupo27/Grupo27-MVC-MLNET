@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Dependência do WebView2 -->
+    <PackageReference Include="Microsoft.ML" Version="4.0.1" />
+    <PackageReference Include="Microsoft.ML.Recommender" Version="0.22.1" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.1343.22" />
+    <PackageReference Include="MySql.Data" Version="9.2.0" />
+    <PackageReference Include="PdfSharp" Version="1.50.5147" />
+    <PackageReference Include="PdfSharp-MigraDoc" Version="6.1.1" />
+  </ItemGroup>
+</Project>
