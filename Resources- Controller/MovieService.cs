@@ -1,19 +1,19 @@
 using Microsoft.ML;
 using Microsoft.ML.Data;
+using Microsoft.ML.Transforms.Text;
 using MovieBookRecommendation.Models;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.IO;
 
 namespace MovieBookRecommendation
 {
     public class MovieService
     {
         private List<MovieData> _moviesList;
-        private List<MovieFeature> _movieFeatures; // Vetores pré-computados
+        private List<MovieFeature> _movieFeatures;
         private ITransformer _transformer;
-        private MLContext _mlContext;
+        private readonly MLContext _mlContext;
 
         public MovieService()
         {
@@ -26,12 +26,12 @@ namespace MovieBookRecommendation
         {
             try
             {
-                // Carrega os filmes do CSV; para teste, pega apenas os primeiros 20 registros
                 IDataView dataView = _mlContext.Data.LoadFromTextFile<MovieData>(
                     "movie.csv", separatorChar: ',', hasHeader: true);
-                _moviesList = _mlContext.Data.CreateEnumerable<MovieData>(dataView, reuseRowObject: false)
-                                              .Take(20)
-                                              .ToList();
+                _moviesList = _mlContext.Data
+                    .CreateEnumerable<MovieData>(dataView, reuseRowObject: false)
+                    .Take(20)
+                    .ToList();
             }
             catch (Exception ex)
             {
@@ -42,68 +42,69 @@ namespace MovieBookRecommendation
 
         private void PreComputeFeatures()
         {
-            // Cria o pipeline para featurizar os textos (título e gêneros)
-            var pipeline = _mlContext.Transforms.Text.FeaturizeText("TitleFeatures", nameof(MovieData.Title))
-                .Append(_mlContext.Transforms.Text.FeaturizeText("GenresFeatures", nameof(MovieData.Genres)))
-                .Append(_mlContext.Transforms.Concatenate("Features", "TitleFeatures", "GenresFeatures"));
+            // Definir opções para fixar o número de n-grams e evitar schema mismatch
+            var textOptions = new TextFeaturizingEstimator.Options
+            {
+                WordFeatureExtractor = new WordBagEstimator.Options
+                {
+                    NgramLength = 1,    // 1-gramas de palavras
+                    UseAllLengths = false // Vetor fixo
+                },
+                CharFeatureExtractor = new WordBagEstimator.Options
+                {
+                    NgramLength = 3,    // 3-gramas de caracteres
+                    UseAllLengths = false // Vetor fixo
+                }
+            };
 
-            IDataView dataView = _mlContext.Data.LoadFromEnumerable(_moviesList);
-            _transformer = pipeline.Fit(dataView);
-            var transformedData = _transformer.Transform(dataView);
-            _movieFeatures = _mlContext.Data.CreateEnumerable<MovieFeature>(transformedData, reuseRowObject: false)
-                                            .ToList();
+            // Pipeline com opções fixas para garantir consistência
+            var pipeline = _mlContext.Transforms.Text
+                .FeaturizeText("TitleFeatures", textOptions, nameof(MovieData.Title))
+                .Append(_mlContext.Transforms.Text.FeaturizeText("GenresFeatures", textOptions, nameof(MovieData.Genres)))
+                .Append(_mlContext.Transforms.Concatenate(
+                    outputColumnName: "Features",
+                    "TitleFeatures", "GenresFeatures"));
+
+            IDataView trainingData = _mlContext.Data.LoadFromEnumerable(_moviesList);
+            _transformer = pipeline.Fit(trainingData);
+            var transformedData = _transformer.Transform(trainingData);
+            _movieFeatures = _mlContext.Data
+                .CreateEnumerable<MovieFeature>(transformedData, reuseRowObject: false)
+                .ToList();
         }
 
-        /// <summary>
-        /// Recomenda filmes baseados em conteúdo usando ML.NET.
-        /// Se os vetores de features não gerarem similaridade positiva (todas zero),
-        /// usa um fallback simples de busca por substring.
-        /// </summary>
-        /// <param name="queryTitle">Termo de busca para o título (ex.: "star")</param>
-        /// <param name="queryGenre">Termo de busca para o gênero (ex.: "action")</param>
-        /// <param name="topN">Número de recomendações desejadas</param>
-        /// <returns>Lista de MovieData com as recomendações</returns>
         public List<MovieData> RecommendMoviesByContent(string queryTitle, string queryGenre, int topN = 10)
         {
-            // Cria um objeto query com os termos desejados
-            var queryMovie = new MovieData { Title = queryTitle, Genres = queryGenre };
-            var queryDataView = _mlContext.Data.LoadFromEnumerable(new List<MovieData> { queryMovie });
-            var transformedQueryData = _transformer.Transform(queryDataView);
-            var queryFeature = _mlContext.Data.CreateEnumerable<MovieFeature>(transformedQueryData, reuseRowObject: false)
-                                              .FirstOrDefault();
-
-            // Se não conseguir gerar features para a query, retorna fallback simples
-            if (queryFeature == null || queryFeature.Features == null)
+            var query = new MovieData { Title = queryTitle, Genres = queryGenre };
+            var queryDv = _mlContext.Data.LoadFromEnumerable(new[] { query });
+            var transformedQuery = _transformer.Transform(queryDv);
+            var feature = _mlContext.Data
+                .CreateEnumerable<MovieFeature>(transformedQuery, reuseRowObject: false)
+                .FirstOrDefault();
+            if (feature?.Features == null)
                 return FallbackRecommendation(queryTitle, queryGenre, topN);
 
-            // Calcula a similaridade cosseno entre o vetor da query e os vetores pré-computados
-            var similarityResults = _movieFeatures.Select(mf => new
+            var results = _movieFeatures.Select(mf => new
             {
                 Movie = mf,
-                Similarity = CosineSimilarity(queryFeature.Features, mf.Features)
+                Similarity = CosineSimilarity(feature.Features, mf.Features)
             }).ToList();
 
-            // Se nenhum filme teve similaridade positiva, utiliza fallback simples
-            if (similarityResults.All(x => x.Similarity == 0))
+            if (results.All(r => r.Similarity == 0))
                 return FallbackRecommendation(queryTitle, queryGenre, topN);
 
-            var results = similarityResults
-                .OrderByDescending(x => x.Similarity)
+            return results
+                .OrderByDescending(r => r.Similarity)
                 .Take(topN)
-                .Select(x => new MovieData
+                .Select(r => new MovieData
                 {
-                    MovieId = x.Movie.MovieId,
-                    Title = x.Movie.Title,
-                    Genres = x.Movie.Genres
+                    MovieId = r.Movie.MovieId,
+                    Title = r.Movie.Title,
+                    Genres = r.Movie.Genres
                 })
                 .ToList();
-
-            return results;
         }
 
-        /// <summary>
-        /// Fallback simples: busca os filmes cujo título e gênero contenham os termos informados.
-        /// </summary>
         private List<MovieData> FallbackRecommendation(string queryTitle, string queryGenre, int topN)
         {
             return _moviesList
@@ -113,22 +114,21 @@ namespace MovieBookRecommendation
                 .ToList();
         }
 
-        // Calcula a similaridade cosseno entre dois vetores
-        private float CosineSimilarity(float[] vectorA, float[] vectorB)
+        private static float CosineSimilarity(float[] a, float[] b)
         {
-            if (vectorA.Length != vectorB.Length)
+            if (a.Length != b.Length)
                 throw new Exception("Vetores devem ter o mesmo tamanho");
 
-            float dot = 0, normA = 0, normB = 0;
-            for (int i = 0; i < vectorA.Length; i++)
+            float dot = 0, na = 0, nb = 0;
+            for (int i = 0; i < a.Length; i++)
             {
-                dot += vectorA[i] * vectorB[i];
-                normA += vectorA[i] * vectorA[i];
-                normB += vectorB[i] * vectorB[i];
+                dot += a[i] * b[i];
+                na += a[i] * a[i];
+                nb += b[i] * b[i];
             }
-            if (normA == 0 || normB == 0)
+            if (na == 0 || nb == 0)
                 return 0;
-            return dot / ((float)Math.Sqrt(normA) * (float)Math.Sqrt(normB));
+            return dot / ((float)Math.Sqrt(na) * (float)Math.Sqrt(nb));
         }
     }
 }
